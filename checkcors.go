@@ -45,8 +45,8 @@ func (c Checker) Check(ctx context.Context, url string) (bool, error) {
 		url,
 		rsp.Header,
 		map[string]string{
-			"Access-Control-Allowed-Methods": "GET",
-			"Access-Control-Allow-Origin":    "*",
+			"Access-Control-Allow-Methods": "GET",
+			"Access-Control-Allow-Origin":  "*",
 		},
 	), nil
 }
@@ -109,17 +109,12 @@ func run(ctx context.Context) error {
 		os.Exit(2)
 	}
 
-	var reqheaderraw []struct {
-		Name  string `json:"name"`
-		Value string `json:"value"`
-	}
-	err := loadJSON(*reqheaderfile, &reqheaderraw)
-	if err != nil {
-		return fmt.Errorf("load request headers: %w", err)
-	}
-	reqheader := make(http.Header, len(reqheaderraw))
-	for _, h := range reqheaderraw {
-		reqheader.Set(h.Name, h.Value)
+	var reqheader http.Header
+	if *reqheaderfile != "" {
+		err := loadJSON(*reqheaderfile, &reqheader)
+		if err != nil {
+			return fmt.Errorf("load request headers: %w", err)
+		}
 	}
 
 	urls, err := loadURLs(*urlfile)
