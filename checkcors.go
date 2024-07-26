@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,55 +13,64 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"golang.org/x/sync/errgroup"
 )
 
 type Checker struct {
-	Client *http.Client
-	Origin string
+	Client    *http.Client
+	ReqHeader http.Header
 }
 
-func (c Checker) Check(ctx context.Context, url string) error {
+func (c Checker) Check(ctx context.Context, url string) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return false, fmt.Errorf("create request: %w", err)
 	}
-	if c.Origin != "" {
-		req.Header.Set("Origin", c.Origin)
-	}
+	req.Header = c.ReqHeader
 
 	rsp, err := c.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("perform request: %w", err)
+		return false, fmt.Errorf("perform request: %w", err)
 	}
 	defer rsp.Body.Close()
 
 	_, err = io.Copy(io.Discard, rsp.Body)
 	if err != nil {
-		return fmt.Errorf("read body: %w", err)
+		return false, fmt.Errorf("read body: %w", err)
 	}
 
 	return checkHeaders(
+		url,
 		rsp.Header,
 		map[string]string{
 			"Access-Control-Allowed-Methods": "GET",
 			"Access-Control-Allow-Origin":    "*",
 		},
-	)
+	), nil
 }
 
-func checkHeaders(h http.Header, expect map[string]string) error {
-	var errs []error
+func checkHeaders(url string, h http.Header, expect map[string]string) bool {
+	ok := true
 	for name, val := range expect {
 		actual := h.Get(name)
 		if actual != val {
-			errs = append(errs, fmt.Errorf("expected header %q to be %q but was %q", name, val, actual))
+			slog.Error("header mismatch", "url", url, "header", name, "expected", val, "got", actual)
+			ok = false
 		}
 	}
 
-	return errors.Join(errs...)
+	return ok
+}
+
+func loadJSON(path string, data any) error {
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal(buf, &data)
 }
 
 func loadURLs(path string) (urls []string, err error) {
@@ -91,12 +101,25 @@ func loadURLs(path string) (urls []string, err error) {
 }
 
 func run(ctx context.Context) error {
-	origin := flag.String("origin", "", "Origin header to send")
+	reqheaderfile := flag.String("reqheaders", "", "path to JSON file with request headers")
 	urlfile := flag.String("urls", "", "path to file with list of URLs to check")
 	flag.Parse()
 	if *urlfile == "" {
 		flag.Usage()
 		os.Exit(2)
+	}
+
+	var reqheaderraw []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	err := loadJSON(*reqheaderfile, &reqheaderraw)
+	if err != nil {
+		return fmt.Errorf("load request headers: %w", err)
+	}
+	reqheader := make(http.Header, len(reqheaderraw))
+	for _, h := range reqheaderraw {
+		reqheader.Set(h.Name, h.Value)
 	}
 
 	urls, err := loadURLs(*urlfile)
@@ -108,20 +131,31 @@ func run(ctx context.Context) error {
 		Client: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		Origin: *origin,
+		ReqHeader: reqheader,
 	}
 
-	eg, ctx := errgroup.WithContext(ctx)
+	var wg sync.WaitGroup
+	wg.Add(len(urls))
+
+	var hadError atomic.Bool
 	for _, url := range urls {
-		eg.Go(func() error {
-			err := checker.Check(ctx, url)
+		go func() {
+			defer wg.Done()
+			ok, err := checker.Check(ctx, url)
 			if err != nil {
-				return fmt.Errorf("check %q: %w", url, err)
+				slog.Error("check URL", "url", url, "err", err)
 			}
-			return nil
-		})
+			if !ok || err != nil {
+				hadError.Store(true)
+			}
+		}()
 	}
-	return eg.Wait()
+
+	wg.Wait()
+	if hadError.Load() {
+		return errors.New("unsuccessful")
+	}
+	return nil
 }
 
 func main() {
