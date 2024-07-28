@@ -24,6 +24,8 @@ type Checker struct {
 }
 
 func (c Checker) Check(ctx context.Context, url string) (bool, error) {
+	slog := slog.With("url", url)
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, fmt.Errorf("create request: %w", err)
@@ -42,7 +44,7 @@ func (c Checker) Check(ctx context.Context, url string) (bool, error) {
 	}
 
 	return checkHeaders(
-		url,
+		slog,
 		rsp.Header,
 		map[string]string{
 			"Access-Control-Allow-Methods": "GET",
@@ -51,12 +53,12 @@ func (c Checker) Check(ctx context.Context, url string) (bool, error) {
 	), nil
 }
 
-func checkHeaders(url string, h http.Header, expect map[string]string) bool {
+func checkHeaders(slog *slog.Logger, h http.Header, expect map[string]string) bool {
 	ok := true
 	for name, val := range expect {
 		actual := h.Get(name)
 		if actual != val {
-			slog.Error("header mismatch", "url", url, "header", name, "expected", val, "got", actual)
+			slog.Error("header mismatch", "header", name, "expected", val, "got", actual)
 			ok = false
 		}
 	}
@@ -84,10 +86,7 @@ func loadURLs(path string) (urls []string, err error) {
 	for s.Scan() {
 		line := s.Text()
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		if trimmed[0] == '#' {
+		if trimmed == "" || trimmed[0] == '#' {
 			continue
 		}
 
