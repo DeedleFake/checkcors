@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"iter"
 	"log/slog"
 	"net/http"
 	"os"
@@ -75,28 +76,29 @@ func loadJSON(path string, data any) error {
 	return json.Unmarshal(buf, &data)
 }
 
-func loadURLs(path string) (urls []string, err error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	s := bufio.NewScanner(file)
-	for s.Scan() {
-		line := s.Text()
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || trimmed[0] == '#' {
-			continue
+func loadURLs(path string, rerr *error) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		file, err := os.Open(path)
+		if err != nil {
+			*rerr = err
+			return
 		}
+		defer file.Close()
 
-		urls = append(urls, line)
-	}
-	if err := s.Err(); err != nil {
-		return nil, fmt.Errorf("scan: %w", err)
-	}
+		s := bufio.NewScanner(file)
+		for s.Scan() {
+			line := s.Text()
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || trimmed[0] == '#' {
+				continue
+			}
 
-	return urls, nil
+			if !yield(line) {
+				return
+			}
+		}
+		*rerr = s.Err()
+	}
 }
 
 func run(ctx context.Context) error {
@@ -116,11 +118,6 @@ func run(ctx context.Context) error {
 		}
 	}
 
-	urls, err := loadURLs(*urlfile)
-	if err != nil {
-		return fmt.Errorf("load URLs: %w", err)
-	}
-
 	checker := Checker{
 		Client: &http.Client{
 			Timeout: 30 * time.Second,
@@ -129,12 +126,13 @@ func run(ctx context.Context) error {
 	}
 
 	var wg sync.WaitGroup
-	wg.Add(len(urls))
-
 	var hadError atomic.Bool
-	for _, url := range urls {
+	var err error
+	for url := range loadURLs(*urlfile, &err) {
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
+
 			ok, err := checker.Check(ctx, url)
 			if err != nil {
 				slog.Error("check URL", "url", url, "err", err)
@@ -143,6 +141,9 @@ func run(ctx context.Context) error {
 				hadError.Store(true)
 			}
 		}()
+	}
+	if err != nil {
+		return fmt.Errorf("load URLs: %w", err)
 	}
 
 	wg.Wait()
